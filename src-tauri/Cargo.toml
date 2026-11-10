@@ -1,0 +1,33 @@
+[package]
+name = "monitortok"
+version = "0.1.0"
+description = "MonitorTok - Antigravity Token & Cost Monitor"
+authors = ["enzo"]
+edition = "2024"
+
+[lib]
+name = "monitortok_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.33", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.11"
+thiserror = "2.0"
+walkdir = "2.5"
+notify = "7.0"
+rayon = "1.10"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
