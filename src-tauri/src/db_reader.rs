@@ -76,9 +76,28 @@ impl SafeDbReader {
     }
 
     pub fn read_gen_metadata(path: &Path) -> Result<Vec<(i64, Vec<u8>)>, DbReaderError> {
+        Self::read_gen_metadata_since(path, -1)
+    }
+
+    pub fn read_gen_metadata_since(
+        path: &Path,
+        min_idx: i64,
+    ) -> Result<Vec<(i64, Vec<u8>)>, DbReaderError> {
         let conn = Self::open_readonly(path)?;
-        let mut stmt = conn.prepare("SELECT idx, data FROM gen_metadata ORDER BY idx ASC")?;
-        let rows = stmt.query_map([], |row| {
+        let max_idx: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(idx), -1) FROM gen_metadata",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        if max_idx <= min_idx {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt =
+            conn.prepare("SELECT idx, data FROM gen_metadata WHERE idx > ?1 ORDER BY idx ASC")?;
+        let rows = stmt.query_map([min_idx], |row| {
             let idx: i64 = row.get(0)?;
             let data: Vec<u8> = row.get(1)?;
             Ok((idx, data))

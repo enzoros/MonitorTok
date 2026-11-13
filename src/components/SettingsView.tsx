@@ -18,6 +18,92 @@ import { api } from "../services/api";
 import { useMonitorStore } from "../store/useMonitorStore";
 import type { ModelPrice } from "../types";
 
+interface DecimalInputProps {
+  value: number;
+  onChange: (value: number) => void;
+  onEnter?: () => void;
+  className?: string;
+}
+
+const DecimalInput: React.FC<DecimalInputProps> = ({
+  value,
+  onChange,
+  onEnter,
+  className = "",
+}) => {
+  const [text, setText] = useState<string>(value.toString());
+  const [focused, setFocused] = useState(false);
+
+  useEffect(() => {
+    if (!focused) {
+      setText(value.toString());
+    }
+  }, [value, focused]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    // Allow empty, digits, and a single dot or comma
+    if (!/^[0-9]*[.,]?[0-9]*$/.test(raw)) return;
+    setText(raw);
+
+    const normalized = raw.replace(",", ".");
+    if (normalized === "" || normalized === ".") return;
+    const parsed = parseFloat(normalized);
+    if (!isNaN(parsed) && parsed >= 0) {
+      onChange(parsed);
+    }
+  };
+
+  const handleBlur = () => {
+    setFocused(false);
+    const normalized = text.replace(",", ".");
+    const parsed = parseFloat(normalized);
+    if (isNaN(parsed) || parsed < 0) {
+      onChange(0);
+      setText("0");
+    } else {
+      onChange(parsed);
+      setText(parsed.toString());
+    }
+  };
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={text}
+      onFocus={() => setFocused(true)}
+      onChange={handleChange}
+      onBlur={handleBlur}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" && onEnter) {
+          handleBlur();
+          onEnter();
+        }
+      }}
+      className={className}
+    />
+  );
+};
+
+const suggestModelRule = (rawModel: string): { pattern: string; displayName: string } => {
+  const base = rawModel.replace(/-(low|medium|high|trial|tiered|n|s)$/i, "");
+  const parts = base.split("-").filter(Boolean);
+  const title = parts
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
+
+  let displayName = title;
+  if (base.startsWith("gemini-")) displayName = `Google ${title}`;
+  else if (base.startsWith("claude-")) displayName = `Anthropic ${title}`;
+  else if (base.startsWith("gpt-")) displayName = `OpenAI ${title}`;
+
+  return {
+    pattern: `*${base}*`,
+    displayName,
+  };
+};
+
 export const SettingsView: React.FC = () => {
   const {
     pricing,
@@ -30,11 +116,25 @@ export const SettingsView: React.FC = () => {
   } = useMonitorStore();
 
   const [localPricing, setLocalPricing] = useState<ModelPrice[]>([]);
+  const [unmatchedModels, setUnmatchedModels] = useState<string[]>([]);
   const [localSubCost, setLocalSubCost] = useState<number>(subscriptionCost);
   const [subCostSaved, setSubCostSaved] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [anonymizeExport, setAnonymizeExport] = useState(true);
   const [exporting, setExporting] = useState(false);
+
+  const loadUnmatched = async () => {
+    try {
+      const models = await api.getUnmatchedModels();
+      setUnmatchedModels(models);
+    } catch (err) {
+      console.error("Failed to fetch unmatched models:", err);
+    }
+  };
+
+  useEffect(() => {
+    loadUnmatched();
+  }, []);
 
   useEffect(() => {
     setLocalSubCost(subscriptionCost);
@@ -85,15 +185,27 @@ export const SettingsView: React.FC = () => {
   const handlePriceChange = (
     index: number,
     field: keyof ModelPrice,
-    value: string
+    value: string | number
   ) => {
     const updated = [...localPricing];
-    if (field === "input_per_1m" || field === "cache_read_per_1m" || field === "output_per_1m") {
-      updated[index][field] = parseFloat(value) || 0;
-    } else {
-      (updated[index] as any)[field] = value;
-    }
+    (updated[index] as any)[field] = value;
     setLocalPricing(updated);
+  };
+
+  const handleAddSuggestedModel = (rawModel: string) => {
+    const { pattern, displayName } = suggestModelRule(rawModel);
+    setLocalPricing([
+      ...localPricing,
+      {
+        model_pattern: pattern,
+        display_name: displayName,
+        input_per_1m: 1.0,
+        cache_read_per_1m: 0.1,
+        output_per_1m: 4.0,
+        valid_from: null,
+        valid_to: null,
+      },
+    ]);
   };
 
   const handleAddRule = () => {
@@ -118,6 +230,7 @@ export const SettingsView: React.FC = () => {
   const handleSave = async () => {
     setSubscriptionCost(localSubCost);
     await savePricing(localPricing);
+    await loadUnmatched();
     setSavedSuccess(true);
     setTimeout(() => setSavedSuccess(false), 3000);
   };
@@ -147,17 +260,10 @@ export const SettingsView: React.FC = () => {
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2">
               <span className="text-xs text-zinc-400 font-mono">$</span>
-              <input
-                type="number"
-                min="0"
-                step="1"
+              <DecimalInput
                 value={localSubCost}
-                onChange={(e) => setLocalSubCost(parseFloat(e.target.value) || 0)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    handleSaveSubCost();
-                  }
-                }}
+                onChange={setLocalSubCost}
+                onEnter={handleSaveSubCost}
                 className="w-24 bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-indigo-500"
               />
               <span className="text-xs text-zinc-400">USD / mes</span>
@@ -257,11 +363,32 @@ export const SettingsView: React.FC = () => {
           Al guardar los cambios, el motor recalculará inmediatamente el valor de todos los turnos históricos almacenados en tu base de datos local.
         </p>
 
+        {unmatchedModels.length > 0 && (
+          <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 space-y-2">
+            <div className="text-xs font-medium text-amber-300">
+              Modelos detectados en tu historial sin tarifa específica (usando tarifa estándar):
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {unmatchedModels.map((model) => (
+                <button
+                  key={model}
+                  onClick={() => handleAddSuggestedModel(model)}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-amber-500/30 text-[11px] font-mono text-amber-200 transition-colors cursor-pointer"
+                  title={`Añadir regla sugerida para ${model}`}
+                >
+                  <Plus className="w-3 h-3 text-amber-400" />
+                  <span>{model}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="overflow-x-auto border border-zinc-800 rounded-xl">
           <table className="w-full text-left text-xs">
             <thead className="bg-zinc-950/60 border-b border-zinc-800 text-zinc-400 font-semibold text-[11px]">
               <tr>
-                <th className="px-3 py-2.5 text-left w-28">Patrón</th>
+                <th className="px-3 py-2.5 text-left min-w-[140px]">Patrón</th>
                 <th className="px-3 py-2.5 text-left min-w-[200px]">Modelo Oficial (Nombre Completo)</th>
                 <th className="px-3 py-2.5 text-center w-24">Input ($/1M)</th>
                 <th className="px-3 py-2.5 text-center w-24">Caché ($/1M)</th>
@@ -294,40 +421,30 @@ export const SettingsView: React.FC = () => {
                     />
                   </td>
                   <td className="px-3 py-2">
-                    <input
-                      type="number"
-                      step="0.01"
+                    <DecimalInput
                       value={item.input_per_1m}
-                      onChange={(e) =>
-                        handlePriceChange(idx, "input_per_1m", e.target.value)
+                      onChange={(val) =>
+                        handlePriceChange(idx, "input_per_1m", val)
                       }
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-center text-zinc-200"
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-center text-zinc-200 focus:outline-none focus:border-indigo-500"
                     />
                   </td>
                   <td className="px-3 py-2">
-                    <input
-                      type="number"
-                      step="0.001"
+                    <DecimalInput
                       value={item.cache_read_per_1m}
-                      onChange={(e) =>
-                        handlePriceChange(
-                          idx,
-                          "cache_read_per_1m",
-                          e.target.value
-                        )
+                      onChange={(val) =>
+                        handlePriceChange(idx, "cache_read_per_1m", val)
                       }
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-center text-cyan-400"
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-center text-cyan-400 focus:outline-none focus:border-indigo-500"
                     />
                   </td>
                   <td className="px-3 py-2">
-                    <input
-                      type="number"
-                      step="0.01"
+                    <DecimalInput
                       value={item.output_per_1m}
-                      onChange={(e) =>
-                        handlePriceChange(idx, "output_per_1m", e.target.value)
+                      onChange={(val) =>
+                        handlePriceChange(idx, "output_per_1m", val)
                       }
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-center text-emerald-400"
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-center text-emerald-400 focus:outline-none focus:border-indigo-500"
                     />
                   </td>
                   <td className="px-3 py-2">

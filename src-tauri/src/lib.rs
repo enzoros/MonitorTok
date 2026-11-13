@@ -51,6 +51,7 @@ pub fn run() {
             commands::get_conversations,
             commands::get_conversation_turns,
             commands::get_model_pricing,
+            commands::get_unmatched_models,
             commands::update_model_pricing,
             commands::trigger_rescan,
             commands::export_data,

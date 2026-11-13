@@ -71,8 +71,8 @@ export const Navbar: React.FC = () => {
             </span>
           </div>
           <p className="text-[11px] text-zinc-400 flex items-center gap-1.5 whitespace-nowrap">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-            <span>Monitoreo en vivo</span>
+            <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
+            <span>Sync cada 30s</span>
             <span className="hidden lg:inline text-zinc-500">(Linux)</span>
           </p>
         </div>

@@ -83,6 +83,10 @@ impl PricingEngine {
     pub fn calculate_cost(&self, model: &str, input: u64, cache: u64, output: u64) -> (f64, String) {
         self.calculate_cost_at(model, None, input, cache, output)
     }
+
+    pub fn matches_any_rule(&self, model: &str) -> bool {
+        self.rules.iter().any(|(re, _)| re.is_match(model))
+    }
 }
 
 pub fn default_pricing() -> Vec<ModelPrice> {

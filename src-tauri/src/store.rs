@@ -16,6 +16,7 @@ use std::time::Instant;
 
 pub struct MetricsStore {
     conn: Connection,
+    pricing_engine: Arc<PricingEngine>,
 }
 
 struct PreparedTurn {
@@ -50,18 +51,32 @@ impl MetricsStore {
              PRAGMA foreign_keys = ON;"
         )?;
 
-        let store = Self { conn };
+        let mut store = Self {
+            conn,
+            pricing_engine: Arc::new(PricingEngine::new(Vec::new())),
+        };
         store.migrate()?;
         store.seed_pricing_if_empty()?;
+        store.reload_pricing_engine()?;
         Ok(store)
     }
 
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn };
+        let mut store = Self {
+            conn,
+            pricing_engine: Arc::new(PricingEngine::new(Vec::new())),
+        };
         store.migrate()?;
         store.seed_pricing_if_empty()?;
+        store.reload_pricing_engine()?;
         Ok(store)
+    }
+
+    fn reload_pricing_engine(&mut self) -> Result<()> {
+        let prices = self.get_pricing()?;
+        self.pricing_engine = Arc::new(PricingEngine::new(prices));
+        Ok(())
     }
 
     pub fn conn(&self) -> &Connection {
@@ -184,6 +199,22 @@ impl MetricsStore {
         Ok(prices)
     }
 
+    pub fn get_unmatched_models(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT model_name FROM turns WHERE model_name != 'desconocido' ORDER BY model_name ASC"
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+        let mut unmatched = Vec::new();
+        for r in rows {
+            let model = r?;
+            if !self.pricing_engine.matches_any_rule(&model) {
+                unmatched.push(model);
+            }
+        }
+        Ok(unmatched)
+    }
+
     pub fn update_pricing(&mut self, prices: Vec<ModelPrice>) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
@@ -225,13 +256,13 @@ impl MetricsStore {
             }
         }
         tx.commit()?;
+        self.reload_pricing_engine()?;
         Ok(())
     }
 
     pub fn sync_all(&mut self, roots: &[AntigravityRoot]) -> Result<SyncStats> {
         let start = Instant::now();
-        let pricing = self.get_pricing()?;
-        let pricing_engine = Arc::new(PricingEngine::new(pricing));
+        let pricing_engine = Arc::clone(&self.pricing_engine);
 
         // Pre-index existing non-empty DBs per root in O(1) time
         let mut db_index: HashMap<String, PathBuf> = HashMap::new();
@@ -336,7 +367,7 @@ impl MetricsStore {
                 let mut turns = Vec::new();
 
                 if let Some(ref db_path) = conv.db_path {
-                    if let Ok(metadata_rows) = SafeDbReader::read_gen_metadata(db_path) {
+                    if let Ok(metadata_rows) = SafeDbReader::read_gen_metadata_since(db_path, last_idx) {
                         for (idx, data) in metadata_rows {
                             if idx > last_idx {
                                 if let Some(turn) = decode_gen_metadata(&data) {
@@ -476,9 +507,6 @@ impl MetricsStore {
             return Ok(0);
         }
 
-        let pricing = self.get_pricing()?;
-        let pricing_engine = PricingEngine::new(pricing);
-
         let (mut last_idx, mut total_turns, mut max_context): (i64, i64, i64) = self
             .conn
             .query_row(
@@ -488,13 +516,54 @@ impl MetricsStore {
             )
             .unwrap_or((0, 0, 0));
 
-        let metadata_rows = match SafeDbReader::read_gen_metadata(db_path) {
+        let metadata_rows = match SafeDbReader::read_gen_metadata_since(db_path, last_idx) {
             Ok(r) => r,
             Err(_) => return Ok(0),
         };
 
+        if metadata_rows.is_empty() {
+            return Ok(0);
+        }
+
         let now_sec = Utc::now().timestamp();
-        let mut new_turns_count = 0;
+        let mut prepared_turns = Vec::new();
+
+        for (idx, data) in metadata_rows {
+            if idx > last_idx {
+                if let Some(turn) = decode_gen_metadata(&data) {
+                    let model = turn.model_name.unwrap_or_else(|| "desconocido".to_string());
+                    let (cost, _) = self.pricing_engine.calculate_cost_at(
+                        &model,
+                        Some(now_sec),
+                        turn.input_tokens,
+                        turn.cache_read_tokens,
+                        turn.output_tokens,
+                    );
+
+                    let context = (turn.input_tokens + turn.cache_read_tokens) as i64;
+                    if context > max_context {
+                        max_context = context;
+                    }
+
+                    prepared_turns.push((
+                        idx,
+                        model,
+                        turn.input_tokens as i64,
+                        turn.cache_read_tokens as i64,
+                        turn.output_tokens as i64,
+                        cost,
+                    ));
+
+                    last_idx = idx;
+                    total_turns += 1;
+                }
+            }
+        }
+
+        let new_turns_count = prepared_turns.len();
+        if new_turns_count == 0 {
+            return Ok(0);
+        }
 
         let tx = self.conn.transaction()?;
         {
@@ -503,53 +572,29 @@ impl MetricsStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
             )?;
 
-            for (idx, data) in metadata_rows {
-                if idx > last_idx {
-                    if let Some(turn) = decode_gen_metadata(&data) {
-                        let model = turn.model_name.unwrap_or_else(|| "desconocido".to_string());
-                        let (cost, _) = pricing_engine.calculate_cost_at(
-                            &model,
-                            Some(now_sec),
-                            turn.input_tokens,
-                            turn.cache_read_tokens,
-                            turn.output_tokens,
-                        );
-
-                        let context = (turn.input_tokens + turn.cache_read_tokens) as i64;
-                        if context > max_context {
-                            max_context = context;
-                        }
-
-                        insert_turn.execute(params![
-                            conv_id,
-                            idx,
-                            now_sec,
-                            model,
-                            turn.input_tokens as i64,
-                            turn.cache_read_tokens as i64,
-                            turn.output_tokens as i64,
-                            Option::<i64>::None,
-                            cost
-                        ])?;
-
-                        last_idx = idx;
-                        total_turns += 1;
-                        new_turns_count += 1;
-                    }
-                }
+            for (idx, model, input_tokens, cache_read_tokens, output_tokens, cost) in prepared_turns {
+                insert_turn.execute(params![
+                    conv_id,
+                    idx,
+                    now_sec,
+                    model,
+                    input_tokens,
+                    cache_read_tokens,
+                    output_tokens,
+                    Option::<i64>::None,
+                    cost
+                ])?;
             }
 
-            if new_turns_count > 0 {
-                tx.execute(
-                    "UPDATE conversations SET
-                        last_processed_idx = ?1,
-                        total_turns = ?2,
-                        max_context_tokens = ?3,
-                        last_updated_at = ?4
-                     WHERE id = ?5",
-                    params![last_idx, total_turns, max_context, now_sec, conv_id],
-                )?;
-            }
+            tx.execute(
+                "UPDATE conversations SET
+                    last_processed_idx = ?1,
+                    total_turns = ?2,
+                    max_context_tokens = ?3,
+                    last_updated_at = ?4
+                 WHERE id = ?5",
+                params![last_idx, total_turns, max_context, now_sec, conv_id],
+            )?;
         }
         tx.commit()?;
 

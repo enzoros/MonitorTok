@@ -376,7 +376,7 @@ export const OverviewView: React.FC = () => {
           className="cursor-pointer group border border-zinc-800 hover:border-indigo-500/50 bg-zinc-900/60 hover:bg-zinc-900 p-4 rounded-2xl transition-all flex items-center justify-between"
         >
           <div className="flex items-center gap-3">
-            <div className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />
+            <div className="w-3 h-3 rounded-full bg-emerald-500" />
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">

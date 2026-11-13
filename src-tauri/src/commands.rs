@@ -75,6 +75,12 @@ pub fn get_model_pricing(state: State<'_, AppState>) -> Result<Vec<ModelPrice>, 
 }
 
 #[tauri::command]
+pub fn get_unmatched_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.get_unmatched_models().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn update_model_pricing(
     state: State<'_, AppState>,
     pricing: Vec<ModelPrice>,

@@ -48,6 +48,7 @@ interface MonitorState {
   fetchPricing: () => Promise<void>;
   savePricing: (pricing: ModelPrice[]) => Promise<void>;
   triggerRescan: () => Promise<void>;
+  refreshLiveMetrics: () => Promise<void>;
   refreshAll: () => Promise<void>;
 }
 
@@ -231,6 +232,14 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
     } finally {
       set({ syncing: false });
     }
+  },
+
+  refreshLiveMetrics: async () => {
+    await Promise.all([
+      get().fetchDashboard(),
+      get().fetchProjects(),
+      get().fetchConversations(),
+    ]);
   },
 
   refreshAll: async () => {

@@ -1,12 +1,61 @@
 use crate::roots::AntigravityRoot;
 use crate::store::MetricsStore;
-use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter};
+
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DbStamp {
+    db: FileStamp,
+    wal: Option<FileStamp>,
+}
+
+fn read_file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
+}
+
+fn read_db_stamp(db_path: &Path) -> Option<DbStamp> {
+    let db = read_file_stamp(db_path)?;
+    if db.len == 0 {
+        return None;
+    }
+    let mut wal_os = db_path.as_os_str().to_os_string();
+    wal_os.push("-wal");
+    let wal = read_file_stamp(Path::new(&wal_os));
+    Some(DbStamp { db, wal })
+}
+
+fn collect_db_stamps(roots: &[AntigravityRoot]) -> HashMap<PathBuf, DbStamp> {
+    let mut stamps = HashMap::new();
+    for root in roots {
+        let conv_dir = root.conversations_dir();
+        if let Ok(entries) = std::fs::read_dir(conv_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("db") {
+                    if let Some(stamp) = read_db_stamp(&path) {
+                        stamps.insert(path, stamp);
+                    }
+                }
+            }
+        }
+    }
+    stamps
+}
 
 pub fn start_file_watcher(
     app: AppHandle,
@@ -14,110 +63,93 @@ pub fn start_file_watcher(
     roots: Vec<AntigravityRoot>,
 ) {
     std::thread::spawn(move || {
-        let (tx, rx) = channel();
-
-        let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("[Watcher] Failed to create recommended watcher: {}", e);
-                return;
-            }
-        };
-
-        for root in &roots {
-            let conv_dir = root.conversations_dir();
-            if conv_dir.exists() {
-                if let Err(e) = watcher.watch(&conv_dir, RecursiveMode::NonRecursive) {
-                    eprintln!("[Watcher] Failed to watch {}: {}", conv_dir.display(), e);
-                } else {
-                    println!("[Watcher] Watching directory: {}", conv_dir.display());
-                }
-            }
-        }
-
-        let debounce_duration = Duration::from_millis(400);
-        let mut pending_files: HashMap<PathBuf, Instant> = HashMap::new();
+        // Seed initial file stamps so we only process changes occurring after startup
+        let mut known_stamps = collect_db_stamps(&roots);
+        println!(
+            "[Poller] Periodic sync started (interval: {}s, tracking {} DBs)",
+            POLL_INTERVAL.as_secs(),
+            known_stamps.len()
+        );
 
         loop {
-            // Check for incoming filesystem events with timeout
-            while let Ok(res) = rx.recv_timeout(Duration::from_millis(100)) {
-                if let Ok(event) = res {
-                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                        for path in event.paths {
-                            if is_conversation_file(&path) {
-                                let target_db = get_base_db_path(&path);
-                                pending_files.insert(target_db, Instant::now());
-                            }
-                        }
+            std::thread::sleep(POLL_INTERVAL);
+
+            let current_stamps = collect_db_stamps(&roots);
+            let mut has_new_db = false;
+            let mut changed_dbs = Vec::new();
+
+            for (path, stamp) in &current_stamps {
+                match known_stamps.get(path) {
+                    None => {
+                        has_new_db = true;
+                        changed_dbs.push(path.clone());
                     }
+                    Some(prev) if prev != stamp => {
+                        changed_dbs.push(path.clone());
+                    }
+                    _ => {}
                 }
             }
 
-            // Process debounced files
-            let now = Instant::now();
-            let mut ready_files = Vec::new();
+            known_stamps = current_stamps;
 
-            pending_files.retain(|path, last_time| {
-                if now.duration_since(*last_time) >= debounce_duration {
-                    ready_files.push(path.clone());
-                    false
-                } else {
-                    true
+            if changed_dbs.is_empty() {
+                continue;
+            }
+
+            let mut store_guard = match store.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("[Poller] Poisoned mutex: {}", e);
+                    continue;
                 }
-            });
+            };
 
-            for db_path in ready_files {
-                let mut store_guard = match store.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        eprintln!("[Watcher] Poisoned mutex: {}", e);
-                        continue;
-                    }
-                };
-
-                match store_guard.sync_single_db(&roots, &db_path) {
-                    Ok(new_turns) => {
-                        if new_turns > 0 {
+            if has_new_db {
+                // New conversation DB detected: run incremental sync_all so metadata/titles are registered
+                match store_guard.sync_all(&roots) {
+                    Ok(stats) => {
+                        if stats.total_turns_processed > 0 || stats.new_conversations > 0 {
                             println!(
-                                "[Watcher] Synced {} new turns for {}",
-                                new_turns,
-                                db_path.display()
+                                "[Poller] Synced {} new turns ({} new convs) in {}ms",
+                                stats.total_turns_processed,
+                                stats.new_conversations,
+                                stats.duration_ms
                             );
-                            let conv_id = db_path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or_default();
-
                             let _ = app.emit(
                                 "metrics://updated",
                                 serde_json::json!({
-                                    "conversation_id": conv_id,
-                                    "new_turns": new_turns
+                                    "full_sync": true,
+                                    "new_turns": stats.total_turns_processed
                                 }),
                             );
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[Watcher] Error syncing {}: {}", db_path.display(), e);
+                    Err(e) => eprintln!("[Poller] Error in sync_all: {}", e),
+                }
+            } else {
+                let mut total_new_turns = 0usize;
+                for db_path in changed_dbs {
+                    match store_guard.sync_single_db(&roots, &db_path) {
+                        Ok(new_turns) => {
+                            total_new_turns += new_turns;
+                        }
+                        Err(e) => {
+                            eprintln!("[Poller] Error syncing {}: {}", db_path.display(), e);
+                        }
                     }
+                }
+
+                if total_new_turns > 0 {
+                    println!("[Poller] Synced {} new turns", total_new_turns);
+                    let _ = app.emit(
+                        "metrics://updated",
+                        serde_json::json!({
+                            "new_turns": total_new_turns
+                        }),
+                    );
                 }
             }
         }
     });
-}
-
-fn is_conversation_file(path: &Path) -> bool {
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-    name.ends_with(".db") || name.ends_with(".db-wal") || name.ends_with(".db-shm")
-}
-
-fn get_base_db_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if s.ends_with(".db-wal") {
-        PathBuf::from(s.trim_end_matches("-wal"))
-    } else if s.ends_with(".db-shm") {
-        PathBuf::from(s.trim_end_matches("-shm"))
-    } else {
-        path.to_path_buf()
-    }
 }

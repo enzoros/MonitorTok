@@ -53,6 +53,10 @@ export const api = {
     return invoke<ModelPrice[]>("get_model_pricing");
   },
 
+  getUnmatchedModels: (): Promise<string[]> => {
+    return invoke<string[]>("get_unmatched_models");
+  },
+
   updateModelPricing: (pricing: ModelPrice[]): Promise<void> => {
     return invoke<void>("update_model_pricing", { pricing });
   },

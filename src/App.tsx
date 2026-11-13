@@ -9,23 +9,38 @@ import { useMonitorStore } from "./store/useMonitorStore";
 import "./App.css";
 
 export const App: React.FC = () => {
-  const { currentTab, refreshAll } = useMonitorStore();
+  const { currentTab, refreshAll, refreshLiveMetrics } = useMonitorStore();
 
   useEffect(() => {
     // 1. Initial load
     refreshAll();
 
-    // 2. Reactive subscription to live changes detected by notify file watcher
+    // 2. Periodic sync event subscription (skip work while window is hidden)
+    let pendingRefresh = false;
     let unlistenFn: (() => void) | undefined;
+
     listen("metrics://updated", (event) => {
-      console.log("[Live Event] metrics://updated:", event.payload);
-      refreshAll();
+      console.log("[Sync Event] metrics://updated:", event.payload);
+      if (document.hidden) {
+        pendingRefresh = true;
+      } else {
+        refreshLiveMetrics();
+      }
     }).then((fn) => {
       unlistenFn = fn;
     });
 
+    const handleVisibilityChange = () => {
+      if (!document.hidden && pendingRefresh) {
+        pendingRefresh = false;
+        refreshLiveMetrics();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
     return () => {
       if (unlistenFn) unlistenFn();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
 
